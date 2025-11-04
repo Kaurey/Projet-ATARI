@@ -9,13 +9,12 @@ import os
 
 gym.register_envs(ale_py)
 
-# ------------------------------- Prétraitement des frames
-def preprocess_frame(frame):
+def preprocess_frame(frame: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
     resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
     return resized.astype(np.float32) / 255.0
 
-def stack_frames(stacked_frames, frame, is_new_episode, stack_size=4):
+def stack_frames(stacked_frames: deque, frame: np.ndarray, is_new_episode: bool, stack_size: int = 4):
     frame = preprocess_frame(frame)
     if is_new_episode or stacked_frames is None:
         stacked_frames = deque([np.zeros((84,84), dtype=np.float32) for _ in range(stack_size)], maxlen=stack_size)
@@ -25,30 +24,28 @@ def stack_frames(stacked_frames, frame, is_new_episode, stack_size=4):
         stacked_frames.append(frame)
     return np.stack(stacked_frames, axis=2), stacked_frames
 
-# ------------------------------- Attention Layer
 class AttentionLayer(layers.Layer):
-    def __init__(self, units):
+    def __init__(self, units: int):
         super().__init__()
         self.W = layers.Dense(units)
         self.U = layers.Dense(units)
         self.V = layers.Dense(1)
-    def call(self, features, hidden):
+
+    def call(self, features: tf.Tensor, hidden: tf.Tensor):
         hidden_with_time_axis = tf.expand_dims(hidden, 1)
         score = tf.nn.tanh(self.W(features) + self.U(hidden_with_time_axis))
         attention_weights = tf.nn.softmax(self.V(score), axis=1)
         context_vector = tf.reduce_sum(attention_weights * features, axis=1)
         return context_vector, attention_weights
 
-# ------------------------------- Dueling DARQN avec CNN + LSTM + Attention
 class DuelingDARQN(tf.keras.Model):
-    def __init__(self, input_shape, action_size, lstm_units=128, attention_units=64):
+    def __init__(self, input_shape, action_size, lstm_units=64, attention_units=32):
         super().__init__()
-        self.conv1 = layers.Conv2D(32, 8, strides=4, activation='relu')
-        self.conv2 = layers.Conv2D(64, 4, strides=2, activation='relu')
-        self.conv3 = layers.Conv2D(64, 3, strides=1, activation='relu')
+        self.conv1 = layers.Conv2D(16, 8, strides=4, activation='relu')
+        self.conv2 = layers.Conv2D(32, 4, strides=2, activation='relu')
         self.flatten = layers.Flatten()
-        self.fc = layers.Dense(256, activation='relu')
-        self.lstm = layers.LSTM(lstm_units, return_state=True, return_sequences=True)
+        self.fc = layers.Dense(128, activation='relu')
+        self.lstm = layers.LSTM(lstm_units, return_sequences=True, return_state=True)
         self.attention = AttentionLayer(attention_units)
         self.value = layers.Dense(1)
         self.advantage = layers.Dense(action_size)
@@ -56,10 +53,8 @@ class DuelingDARQN(tf.keras.Model):
     def call(self, x, hidden_state=None, cell_state=None):
         batch_size, seq_len, h, w, c = x.shape
         x = tf.reshape(x, (-1, h, w, c))
-        x = tf.cast(x, tf.float32)
         x = self.conv1(x)
         x = self.conv2(x)
-        x = self.conv3(x)
         x = self.flatten(x)
         x = self.fc(x)
         x = tf.reshape(x, (batch_size, seq_len, -1))
@@ -73,7 +68,6 @@ class DuelingDARQN(tf.keras.Model):
         q = v + (a - tf.reduce_mean(a, axis=1, keepdims=True))
         return q, h, c, attn_weights
 
-# ------------------------------- Agent
 class Agent:
     def __init__(self, input_shape, seq_len, action_size):
         self.seq_len = seq_len
@@ -82,44 +76,42 @@ class Agent:
         dummy = tf.zeros((1, seq_len, *input_shape), dtype=tf.float32)
         _ = self.model(dummy)
 
-    def act(self, seq_state):
+    def act(self, seq_state, epsilon=0.05):
+        if np.random.rand() < epsilon:
+            return np.random.randint(self.action_size)
         q_values, _, _, _ = self.model(np.expand_dims(seq_state, axis=0))
         return int(tf.argmax(q_values[0]).numpy())
 
-# ------------------------------- Hyperparamètres
-stack_size, seq_len = 4, 4
-input_shape = (84,84,stack_size)
-model_path = "checkpoints/darqn_episode_20.weights.h5"  # <-- chemin de ton modèle
-num_episodes = 5  # nombre d'épisodes de test
+STACK_SIZE, SEQ_LEN = 4, 4
+INPUT_SHAPE = (84,84,STACK_SIZE)
+NUM_EPISODES = 5
+EPSILON = 0.05
+CHECKPOINT_PATH = "checkpoints/darqn_final.weights.h5"
 
-# ------------------------------- Évaluation
 env = gym.make("ALE/MsPacman-v5", render_mode="human")
-action_size = env.action_space.n
+ACTION_SIZE = env.action_space.n
 
-agent = Agent(input_shape, seq_len, action_size)
-agent.model.load_weights(model_path)
-print(f"Modèle chargé depuis {model_path}")
+agent = Agent(INPUT_SHAPE, SEQ_LEN, ACTION_SIZE)
+agent.model.load_weights(CHECKPOINT_PATH)
+print(f"✅ Modèle chargé depuis : {CHECKPOINT_PATH}")
 
-try:
-    for ep in range(1, num_episodes+1):
-        state, _ = env.reset()
-        stacked_frames = None
-        state, stacked_frames = stack_frames(stacked_frames, state, True)
-        seq_buffer = deque([state]*seq_len, maxlen=seq_len)
-        done = False
-        total_reward = 0
+for ep in range(1, NUM_EPISODES+1):
+    state, _ = env.reset(seed=np.random.randint(0,10000))
+    stacked_frames = None
+    state, stacked_frames = stack_frames(stacked_frames, state, True)
+    seq_buffer = deque([state + np.random.normal(0,0.01,state.shape) for _ in range(SEQ_LEN)], maxlen=SEQ_LEN)
+    done = False
+    total_reward = 0
 
-        while not done:
-            seq_state = np.stack(seq_buffer, axis=0)
-            action = agent.act(seq_state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            next_state_stack, stacked_frames = stack_frames(stacked_frames, next_state, False, stack_size)
-            seq_buffer.append(next_state_stack)
-            total_reward += reward
+    while not done:
+        seq_state = np.stack(seq_buffer, axis=0)
+        action = agent.act(seq_state, EPSILON)
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+        next_state_stack, stacked_frames = stack_frames(stacked_frames, next_state, False, STACK_SIZE)
+        seq_buffer.append(next_state_stack)
+        total_reward += reward
 
-        print(f"Episode {ep}/{num_episodes} terminé ! Score total : {total_reward}")
+    print(f"Episode {ep} | Score total : {total_reward}")
 
-finally:
-    env.close()
-    print("Fenêtre fermée proprement.")
+env.close()
